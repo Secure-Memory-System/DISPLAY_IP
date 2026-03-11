@@ -23,4 +23,3 @@ module fnd_cntr(
     seg_decoder dec(.hex_value(digit_value),.seg(seg));
     
 endmodule 
-
