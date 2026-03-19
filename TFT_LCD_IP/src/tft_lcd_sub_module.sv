@@ -486,14 +486,14 @@ module xpt2046(
     always@(posedge Clk50m or negedge Rst_n)
     if(!Rst_n)
         X_Value <= 12'd0;
-    else if(r_Get_Flag)
+    else if(Get_Flag)
         X_Value <= r_X_Value;
 
-    // 마지막 변환 결과를 필터링하기 위해 마지막 Y 결과를 출력으로 저장합니다. 마지막 변환 결과에는 보도 자료가 포함된 순간이 포함되어 있으므로 결과가 안정적이지 않습니다.        
+    // 마지막 변환 결과를 필터링하기 위해 마지막 Y 결과를 출력으로 저장합니다. 마지막 변환 결과에는 보도 자료가 포함된 순간이 포함되어 있으므로 결과가 안정적이지 않습니다.
     always@(posedge Clk50m or negedge Rst_n)
     if(!Rst_n)
         Y_Value <= 12'd0;
-    else if(r_Get_Flag)
+    else if(Get_Flag)
         Y_Value <= r_Y_Value;
 
 endmodule
@@ -561,58 +561,67 @@ endmodule
  */
 module lcd_bram_dp #(
     parameter WIDTH = 8,
-    parameter DEPTH = 28 * 28   // 784
+    parameter DEPTH = 28 * 28 // 784 bytes
 )(
-    // =========================================================
-    // Port A: LCD 표시 읽기 + 터치/클리어 쓰기
-    // =========================================================
-    input  wire               clka,
-    input  wire               ena,
-    input  wire               wea,          // 1: 쓰기, 0: 읽기
-    input  wire [9:0]         addra,        // 0 ~ 783
-    input  wire [WIDTH-1:0]   dina,         // 쓰기 데이터
-    output reg  [WIDTH-1:0]   douta,        // 읽기 데이터 (LCD 표시용)
+    // Port A: 8-bit (LCD 표시 및 터치 쓰기)
+    input  wire        clka,
+    input  wire        ena,
+    input  wire        wea,
+    input  wire [9:0]  addra,  // 0 ~ 783 (8-bit 단위 주소)
+    input  wire [7:0]  dina,
+    output reg  [7:0]  douta,
 
-    // =========================================================
-    // Port B: write_master 읽기 전용
-    // =========================================================
-    input  wire               clkb,
-    input  wire               enb,
-    input  wire [9:0]         addrb,        // write_master가 지정하는 주소
-    output reg  [WIDTH-1:0]   doutb         // write_master로 나가는 데이터
+    // Port B: 32-bit (write_master 읽기 전용)
+    input  wire        clkb,
+    input  wire        enb,
+    input  wire [7:0]  addrb,  // 0 ~ 195 (32-bit 단위 주소)
+    output reg  [31:0] doutb
 );
 
-    // 실제 메모리 배열
-    reg [WIDTH-1:0] ram [0:DEPTH-1];
+    // ★ 핵심: 내부 메모리를 8비트 784개가 아닌, 32비트 196개로 선언!
+    reg [31:0] ram [0:195];
 
-    // 초기화 (시뮬레이션용, 합성 시 BRAM 초기값 0)
     integer i;
     initial begin
-        for (i = 0; i < DEPTH; i = i + 1)
-            ram[i] = 8'h00;
+        for (i = 0; i < 196; i = i + 1)
+            ram[i] = 32'h0000_0000;
     end
 
     // =========================================================
-    // Port A 동작
-    // 쓰기 우선 (Write-First): wea=1이면 쓰고 같은 클럭에 douta도 갱신
+    // Port A 동작 (8-bit 접근을 32-bit 메모리에 매핑)
     // =========================================================
+    wire [7:0] word_addr = addra[9:2]; // 32비트 배열의 인덱스 (0~195)
+    wire [1:0] byte_sel  = addra[1:0]; // 4바이트 중 어느 위치인지 (0~3)
+
     always @(posedge clka) begin
         if (ena) begin
             if (wea) begin
-                ram[addra] <= dina;
-                douta <= dina;          // Write-First
+                // 쓰는 위치에 따라 32비트 중 8비트만 골라서 씀
+                case (byte_sel)
+                    2'b00: ram[word_addr][7:0]   <= dina;
+                    2'b01: ram[word_addr][15:8]  <= dina;
+                    2'b10: ram[word_addr][23:16] <= dina;
+                    2'b11: ram[word_addr][31:24] <= dina;
+                endcase
+                douta <= dina; // Write-First 특성 유지
             end else begin
-                douta <= ram[addra];    // 읽기
+                // 읽을 때도 32비트 중 해당하는 8비트만 골라서 출력
+                case (byte_sel)
+                    2'b00: douta <= ram[word_addr][7:0];
+                    2'b01: douta <= ram[word_addr][15:8];
+                    2'b10: douta <= ram[word_addr][23:16];
+                    2'b11: douta <= ram[word_addr][31:24];
+                endcase
             end
         end
     end
 
     // =========================================================
-    // Port B 동작 (읽기 전용)
+    // Port B 동작 (32-bit 통째로 아주 쉽게 읽기)
     // =========================================================
     always @(posedge clkb) begin
         if (enb) begin
-            doutb <= ram[addrb];
+            doutb <= ram[addrb]; // 4개의 주소를 부를 필요 없이 한 번에!
         end
     end
 

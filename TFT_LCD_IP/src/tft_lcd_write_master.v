@@ -1,16 +1,5 @@
 `timescale 1ns / 1ps
 
-/**
- * write_master
- * 기능: 외부에서 주어진 데이터(BRAM 포트)를 AXI4-Full Burst Write로 메모리에 저장.
- *
- * 동작 순서:
- *   IDLE → ADDR (AW 채널) → DATA (W 채널, burst) → RESP (B 채널) → DONE
- *
- * 파라미터:
- *   BURST_LEN  : 한 번의 버스트에 전송할 beat 수 (최대 256)
- *   TOTAL_BEATS: 전송할 총 beat 수 (28*28=784 bytes → 196 beats @32bit)
- */
 module tft_lcd_write_master #(
     parameter integer C_M_AXI_ADDR_WIDTH = 32,
     parameter integer C_M_AXI_DATA_WIDTH = 32,
@@ -25,28 +14,28 @@ module tft_lcd_write_master #(
     input  wire [31:0] i_total_len,   // 전송할 총 바이트 수 (784)
     output reg         o_write_done,  // 완료 펄스 (1클럭)
 
-    // BRAM 읽기 포트 (tft_lcd_top의 ext_rd_addr/ext_rd_data)
-    output reg  [9:0]  o_bram_rd_addr,
-    input  wire [7:0]  i_bram_rd_data,
+    // BRAM 읽기 포트
+    output reg  [7:0]  o_bram_rd_addr,  // 0 ~ 195 (32-bit 단위 주소)
+    input  wire [31:0] i_bram_rd_data,  // 32-bit 데이터
 
     // AXI4-Full Write
     // AW Channel
     output reg  [C_M_AXI_ADDR_WIDTH-1:0] m_axi_awaddr,
-    output wire [7:0]                     m_axi_awlen,
-    output wire [2:0]                     m_axi_awsize,
-    output wire [1:0]                     m_axi_awburst,
-    output reg                            m_axi_awvalid,
-    input  wire                           m_axi_awready,
+    output wire [7:0]                    m_axi_awlen,
+    output wire [2:0]                    m_axi_awsize,
+    output wire [1:0]                    m_axi_awburst,
+    output reg                           m_axi_awvalid,
+    input  wire                          m_axi_awready,
     // W Channel
     output reg  [C_M_AXI_DATA_WIDTH-1:0] m_axi_wdata,
     output wire [C_M_AXI_DATA_WIDTH/8-1:0] m_axi_wstrb,
-    output reg                            m_axi_wlast,
-    output reg                            m_axi_wvalid,
-    input  wire                           m_axi_wready,
+    output reg                           m_axi_wlast,
+    output reg                           m_axi_wvalid,
+    input  wire                          m_axi_wready,
     // B Channel
-    input  wire [1:0]                     m_axi_bresp,
-    input  wire                           m_axi_bvalid,
-    output wire                           m_axi_bready
+    input  wire [1:0]                    m_axi_bresp,
+    input  wire                          m_axi_bvalid,
+    output wire                          m_axi_bready
 );
 
     // 고정 설정
@@ -69,44 +58,36 @@ module tft_lcd_write_master #(
                DONE  = 3'd4;
 
     reg [2:0]  state;
-    reg [31:0] beats_sent;      // 지금까지 전송한 beat 수
+    reg [31:0] beats_sent;      // 지금까지 전송한 총 beat 수
     reg [7:0]  burst_cnt;       // 현재 버스트 내 beat 카운터
-    reg [7:0]  cur_burst_len;   // 이번 버스트의 실제 beat 수 (마지막 버스트 나머지 대응)
+    reg [7:0]  cur_burst_len;   // 이번 버스트의 실제 beat 수
     reg [31:0] cur_dst_addr;    // 현재 버스트 시작 주소
 
-    // BRAM 주소는 beat 단위 (32bit = 4bytes → bram_addr는 byte 단위이므로 *4)
-    // 단, 내부 BRAM은 8bit 폭이므로 beats_sent * 4 가 bram byte 주소
-    // ext_rd_addr는 10비트(0~783), 여기서는 byte 순서로 읽고 32bit 패킹
-    reg [9:0]  byte_ptr;        // 현재 읽고 있는 BRAM byte 주소 (0~783)
-    reg [1:0]  pack_cnt;        // 4바이트 패킹 카운터
-    reg [31:0] packed_data;     // 패킹 중인 32bit 워드
+    // ★ Y축 반전용: 행 내 워드 위치 카운터 (0~6, 한 행 = 7워드 = 28픽셀)
+    reg [2:0]  col_in_row;
 
-    // 패킹 상태
-    localparam PACK_IDLE  = 2'd0,
-               PACK_READ  = 2'd1,
-               PACK_READY = 2'd2;
-    reg [1:0] pack_state;
-    reg       data_ready;       // 32bit 워드 준비 완료
+    // 상태 선언부 변경 (fetch_state를 2비트로)
+    localparam FETCH_ADDR  = 2'd0,
+               FETCH_WAIT  = 2'd1,
+               FETCH_READY = 2'd2;
+    reg [1:0] fetch_state;
 
     always @(posedge clk or negedge reset_n) begin
         if (!reset_n) begin
-            state         <= IDLE;
-            beats_sent    <= 0;
-            burst_cnt     <= 0;
-            cur_burst_len <= BURST_LEN;
-            cur_dst_addr  <= 0;
-            byte_ptr     <= 0;
-            pack_cnt     <= 0;
-            packed_data  <= 0;
-            pack_state   <= PACK_IDLE;
-            data_ready   <= 0;
-            o_write_done <= 0;
-            m_axi_awvalid <= 0;
-            m_axi_awaddr  <= 0;
-            m_axi_wvalid  <= 0;
-            m_axi_wlast   <= 0;
-            m_axi_wdata   <= 0;
+            state          <= IDLE;
+            beats_sent     <= 0;
+            burst_cnt      <= 0;
+            cur_burst_len  <= BURST_LEN;
+            cur_dst_addr   <= 0;
             o_bram_rd_addr <= 0;
+            col_in_row     <= 0;
+            fetch_state    <= FETCH_WAIT;
+            o_write_done   <= 0;
+            m_axi_awvalid  <= 0;
+            m_axi_awaddr   <= 0;
+            m_axi_wvalid   <= 0;
+            m_axi_wlast    <= 0;
+            m_axi_wdata    <= 0;
         end else begin
             o_write_done <= 0; // 기본 0
 
@@ -114,13 +95,13 @@ module tft_lcd_write_master #(
                 // -----------------------------------------------
                 IDLE: begin
                     if (i_start) begin
-                        cur_dst_addr  <= i_dst_addr;
-                        beats_sent    <= 0;
-                        byte_ptr      <= 0;
-                        pack_cnt      <= 0;
-                        pack_state    <= PACK_IDLE;
-                        data_ready    <= 0;
-                        // 첫 버스트 길이 결정: total_beats < BURST_LEN이면 나머지만
+                        cur_dst_addr   <= i_dst_addr;
+                        beats_sent     <= 0;
+                        o_bram_rd_addr <= 8'd189; // ★ row 27부터 시작 (27*7=189)
+                        col_in_row     <= 3'd0;
+                        fetch_state    <= FETCH_ADDR;
+                        
+                        // 첫 버스트 길이 결정
                         cur_burst_len <= (total_beats < BURST_LEN) ? total_beats[7:0] : BURST_LEN;
                         state         <= ADDR;
                     end
@@ -134,64 +115,57 @@ module tft_lcd_write_master #(
                     if (m_axi_awready && m_axi_awvalid) begin
                         m_axi_awvalid <= 0;
                         burst_cnt     <= 0;
+                        fetch_state   <= FETCH_ADDR;
                         state         <= DATA;
                     end
                 end
 
                 // -----------------------------------------------
-                // W 채널: 버스트 데이터 전송
-                // BRAM은 8bit이므로 4클럭마다 32bit 워드 1개 조립
+                // W 채널: BRAM에서 32bit 통째로 읽어서 바로 쏘기
                 DATA: begin
-                    // --- BRAM 4바이트 패킹 ---
-                    case (pack_state)
-                        PACK_IDLE: begin
-                            data_ready <= 0;
-                            o_bram_rd_addr <= byte_ptr;
-                            pack_state     <= PACK_READ;
-                            pack_cnt       <= 0;
-                            packed_data    <= 0;
+                    case (fetch_state)
+                        FETCH_ADDR: begin
+                            // o_bram_rd_addr는 이미 셋업됨. BRAM이 데이터를 꺼낼 1클럭 대기
+                            fetch_state <= FETCH_WAIT;
                         end
+                        
+                        FETCH_WAIT: begin
+                            // ★ Q7 정규화: 0xFF(255) → 0x80(128=1.0), 0x00 → 0x00
+                            //   학습 시 x/255 정규화 사용 → Q7에서 1.0 = 128
+                            //   LCD 표시용 BRAM(0xFF)은 그대로, NPU행 값만 변환
+                            m_axi_wdata[ 7: 0] <= (i_bram_rd_data[ 7: 0] != 8'd0) ? 8'h80 : 8'h00;
+                            m_axi_wdata[15: 8] <= (i_bram_rd_data[15: 8] != 8'd0) ? 8'h80 : 8'h00;
+                            m_axi_wdata[23:16] <= (i_bram_rd_data[23:16] != 8'd0) ? 8'h80 : 8'h00;
+                            m_axi_wdata[31:24] <= (i_bram_rd_data[31:24] != 8'd0) ? 8'h80 : 8'h00;
+                            m_axi_wvalid <= 1;
+                            m_axi_wlast  <= (burst_cnt == cur_burst_len - 1);
+                            fetch_state  <= FETCH_READY;
+                        end
+            
+                        FETCH_READY: begin
+                            if (m_axi_wready && m_axi_wvalid) begin
+                                m_axi_wvalid   <= 0;
+                                m_axi_wlast    <= 0;
+                                beats_sent     <= beats_sent + 1;
+                                burst_cnt      <= burst_cnt + 1;
 
-                        PACK_READ: begin
-                            // 매 클럭 1바이트 읽어서 32bit에 쌓기
-                            packed_data <= {i_bram_rd_data, packed_data[31:8]};
-                            pack_cnt    <= pack_cnt + 1;
-                            if (pack_cnt < 3) begin
-                                o_bram_rd_addr <= byte_ptr + pack_cnt + 1;
-                            end else begin
-                                // 4바이트 완성
-                                data_ready <= 1;
-                                pack_state <= PACK_READY;
+                                // ★ Y축 반전: 행 내에서는 +1, 행 끝(col=6)이면 이전 행 시작으로 점프
+                                if (col_in_row == 3'd6) begin
+                                    col_in_row     <= 3'd0;
+                                    o_bram_rd_addr <= o_bram_rd_addr - 8'd13; // 현재행 시작 - 7 = 이전행 시작
+                                end else begin
+                                    col_in_row     <= col_in_row + 1;
+                                    o_bram_rd_addr <= o_bram_rd_addr + 1;
+                                end
+                                
+                                if (burst_cnt == cur_burst_len - 1) begin
+                                    state <= RESP;
+                                end else begin
+                                    fetch_state <= FETCH_ADDR; // 다시 다음 데이터 주소부터 대기
+                                end
                             end
-                        end
-
-                        PACK_READY: begin
-                            // data_ready=1, wvalid 올리기
                         end
                     endcase
-
-                    // --- AXI W 채널 핸드셰이크 ---
-                    if (data_ready) begin
-                        m_axi_wvalid <= 1;
-                        m_axi_wdata  <= packed_data;
-                        // wlast: 현재 버스트의 마지막 beat (cur_burst_len 기준)
-                        m_axi_wlast  <= (burst_cnt == cur_burst_len - 1);
-
-                        if (m_axi_wready && m_axi_wvalid) begin
-                            beats_sent   <= beats_sent + 1;
-                            burst_cnt    <= burst_cnt + 1;
-                            byte_ptr     <= byte_ptr + 4;
-                            data_ready   <= 0;
-                            pack_state   <= PACK_IDLE;
-                            m_axi_wvalid <= 0;
-                            m_axi_wlast  <= 0;
-
-                            if (burst_cnt == cur_burst_len - 1) begin
-                                // 버스트 완료 → B채널 응답 대기
-                                state <= RESP;
-                            end
-                        end
-                    end
                 end
 
                 // -----------------------------------------------
@@ -202,7 +176,6 @@ module tft_lcd_write_master #(
                         if (beats_sent >= total_beats) begin
                             state <= DONE;
                         end else begin
-                            // 남은 beat가 BURST_LEN보다 적으면 나머지만 전송
                             cur_burst_len <= ((total_beats - beats_sent) < BURST_LEN)
                                             ? (total_beats - beats_sent)
                                             : BURST_LEN;

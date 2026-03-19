@@ -1,19 +1,6 @@
 `timescale 1ns / 1ps
 
 /**
- * axi_lcd_wrapper
- * 기능: 터치 LCD 입력을 받아 28x28 그리드를 외부 BRAM_0에 AXI4-Full로 전송.
- *
- * 레지스터 맵 (AXI4-Lite, Base Addr 기준):
- *   0x00 : CTRL
- *            [0] start     - write 1 → DMA 전송 시작 (1클럭 후 자동 clear)
- *            [1] bram_clear- write 1 → 내부 BRAM 전체 클리어 (1클럭 후 자동 clear)
- *   0x04 : STAT  (read-only)
- *            [0] done      - DMA 전송 완료 펄스
- *            [1] busy      - DMA 전송 중
- *   0x08 : DST_ADDR - BRAM_0 목적지 주소
- *   0x0C : TRF_LEN  - 전송 바이트 수 (보통 784 고정)
- *
  * 동작 흐름:
  *   1. 사용자가 LCD에 숫자 그리기
  *   2. Zynq 버튼 인터럽트 → CPU가 DST_ADDR, TRF_LEN 설정 후 CTRL[0]=1
@@ -110,12 +97,13 @@ module tft_lcd_axi_wrapper #(
     reg [C_S_AXI_ADDR_WIDTH-1:0] aw_addr_lat;
     reg [C_S_AXI_DATA_WIDTH-1:0] w_data_lat;
 
-    assign s_axi_awready = !aw_latched && !bvalid_reg;
-    assign s_axi_wready  = !w_latched  && !bvalid_reg;
+    assign s_axi_awready = !aw_latched;
+    assign s_axi_wready  = !w_latched;
     assign s_axi_bvalid  = bvalid_reg;
     assign s_axi_bresp   = 2'b00;
 
-    wire write_en = aw_latched && w_latched;
+
+    wire write_en = aw_latched && w_latched && !bvalid_reg;
 
     always @(posedge aclk) begin
         if (!aresetn) begin
@@ -163,14 +151,23 @@ module tft_lcd_axi_wrapper #(
         end
     end
 
-    // STAT 레지스터 (read-only)
-    wire dma_done;
-    wire dma_busy;
+    // ★ 추가: dma_done 펄스를 래치하여 유지
+    reg done_latch;
+    always @(posedge aclk) begin
+        if (!aresetn)
+            done_latch <= 1'b0;
+        else if (dma_done)
+            done_latch <= 1'b1;     // 전송이 끝나면 1로 유지
+        else if (dma_start)
+            done_latch <= 1'b0;     // 다음 전송 시작 시 0으로 초기화
+    end
+
+    // 원래 있던 slv_reg1 할당 부분을 아래처럼 수정!
     always @(posedge aclk) begin
         if (!aresetn)
             slv_reg1 <= 0;
         else begin
-            slv_reg1[0] <= dma_done;
+            slv_reg1[0] <= done_latch; // 펄스 대신 래치된 값 사용!
             slv_reg1[1] <= dma_busy;
         end
     end
@@ -198,40 +195,59 @@ module tft_lcd_axi_wrapper #(
             rvalid_reg <= 0;
             rdata_reg  <= 0;
         end else begin
-            rvalid_reg <= s_axi_arvalid;
-            case (s_axi_araddr[4:2])
-                3'h0: rdata_reg <= slv_reg0;
-                3'h1: rdata_reg <= slv_reg1;
-                3'h2: rdata_reg <= slv_reg2;
-                3'h3: rdata_reg <= slv_reg3;
-                default: rdata_reg <= 0;
-            endcase
+            // ARVALID와 ARREADY가 만나면 읽기 응답(RVALID) 시작
+            if (s_axi_arvalid && arready_reg) begin
+                rvalid_reg <= 1;
+                case (s_axi_araddr[4:2])
+                    3'h0: rdata_reg <= slv_reg0;
+                    3'h1: rdata_reg <= slv_reg1;
+                    3'h2: rdata_reg <= slv_reg2;
+                    3'h3: rdata_reg <= slv_reg3;
+                    default: rdata_reg <= 0;
+                endcase
+            end 
+            // 마스터가 데이터를 받아가면(RREADY) RVALID 내림
+            else if (s_axi_rvalid && s_axi_rready) begin
+                rvalid_reg <= 0;
+            end
         end
     end
 
     // =========================================================
     // [Part 2] 내부 신호 배선
     // =========================================================
-    wire        dma_start  = slv_reg0[0];
     wire        bram_clear = slv_reg0[1];
     wire [31:0] dst_addr   = slv_reg2;
     wire [31:0] trf_len    = slv_reg3;
-
-    // dma_busy를 간단히 SR 플립플롭으로 구현
-    reg busy_reg;
+    wire [7:0]  ext_rd_addr;
+    wire [31:0] ext_rd_data;
+    
+    (* mark_debug = "true" *) wire pen_lock;
+    (* mark_debug = "true" *) reg  busy_reg;
+    
+    // ★ 수정: start_pulse를 slv_reg0[0]에서 분리
+    // write_en이 CTRL 레지스터에 1을 쓰는 순간 1클럭 펄스 생성
+    // → auto-clear 경쟁 조건 완전히 제거
+    (* mark_debug = "true" *) reg  start_pulse;
+    wire dma_start = start_pulse;
+    
     always @(posedge aclk) begin
-        if (!aresetn)   busy_reg <= 0;
+        if (!aresetn)
+            start_pulse <= 1'b0;
+        else if (write_en && (wr_addr_idx == 3'h0) && w_data_lat[0])
+            start_pulse <= 1'b1;  // write_en 발생 클럭 자체에서 펄스 생성
+        else
+            start_pulse <= 1'b0;  // 1클럭 후 자동 소멸
+    end
+    
+    assign dma_busy = busy_reg;
+    assign pen_lock = busy_reg;
+    
+    always @(posedge aclk) begin
+        if (!aresetn)       busy_reg <= 0;
         else if (dma_start) busy_reg <= 1;
         else if (dma_done)  busy_reg <= 0;
     end
-    
-    assign dma_busy = busy_reg; 
-
-    wire pen_lock = busy_reg; // 전송 중 터치 차단
-
-    // BRAM 읽기 포트 (write_master → tft_lcd_top)
-    wire [9:0] ext_rd_addr;
-    wire [7:0] ext_rd_data;
 
     // =========================================================
     // [Part 3] tft_lcd_top 인스턴스
